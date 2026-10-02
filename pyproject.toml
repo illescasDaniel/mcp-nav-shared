@@ -1,6 +1,6 @@
 [project]
 name = "mcp-nav-shared"
-version = "0.1.1"
+version = "0.2.0"
 description = "Shared helpers (LSP client, symbol resolution, formatting, workspace-root discovery) for the codenav/webnav MCP servers"
 readme = "README.md"
 requires-python = ">=3.11"

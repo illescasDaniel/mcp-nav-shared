@@ -17,7 +17,7 @@ import logging
 import os
 import re
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -91,6 +91,10 @@ class OpenFile:
 	size: int
 
 
+# `OpenFile.mtime_ns` of a document whose text came from `overlay()` rather than the disk: never
+# equals a real mtime, so the next `ensure_open` after the overlay ends re-reads the file.
+_OVERLAY_MTIME = -2
+
 # LSP `FileChangeType`.
 _FILE_CREATED, _FILE_CHANGED, _FILE_DELETED = 1, 2, 3
 
@@ -140,6 +144,10 @@ class LspClient:
 	_config_snapshot: dict[Path, tuple[int, int]] | None = field(default=None, init=False)
 	_config_hashes: dict[Path, str] = field(default_factory=dict, init=False)
 	_refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+	# uri -> text shown to the server instead of the disk's, while `overlay()` is active.
+	_overlays: dict[str, str] = field(default_factory=dict, init=False)
+	# Held for the whole of an `overlay()`: `refresh()` (every tool call) waits for it.
+	_overlay_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 	_reader_task: asyncio.Task | None = field(default=None, init=False)
 	_stderr_task: asyncio.Task | None = field(default=None, init=False)
 	_stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=_STDERR_TAIL_LINES), init=False)
@@ -218,6 +226,7 @@ class LspClient:
 		self._open_files = {}
 		self._diag_events = {}
 		self._symbol_cache = {}
+		self._overlays = {}
 		await self.start()
 		if self.on_restart is not None:
 			await self.on_restart(self)
@@ -375,6 +384,8 @@ class LspClient:
 	async def ensure_open(self, file_path: str) -> str:
 		abs_path = self._to_uri(file_path)
 		uri = abs_path.as_uri()
+		if uri in self._overlays:
+			return uri
 		stat = abs_path.stat()
 		known = self._open_files.get(uri)
 		if known is not None and known.mtime_ns == stat.st_mtime_ns and known.size == stat.st_size:
@@ -497,6 +508,8 @@ class LspClient:
 		`workspace/didChangeWatchedFiles`. A change to a `config_names` file restarts
 		the server instead (it only reads its project config at startup).
 		"""
+		async with self._overlay_lock:
+			pass  # a simulation in progress shows the server unsaved text: don't mix its state with the disk's
 		async with self._refresh_lock:
 			current, configs = await asyncio.to_thread(self._scan_watched)
 			previous_configs = self._config_snapshot
@@ -670,6 +683,129 @@ class LspClient:
 	async def supertypes(self, item: dict[str, Any]) -> list[dict[str, Any]]:
 		resp = await self._request("typeHierarchy/supertypes", {"item": item})
 		return resp.get("result") or []
+
+	# -- write-side calls ------------------------------------------------------
+
+	async def prepare_rename(self, file_path: str, line: int, column: int) -> dict[str, Any] | None:
+		"""The range (and placeholder) a rename at the position would replace, or None
+		when the symbol can't be renamed (builtins, keywords, library code)."""
+		uri = await self.ensure_open(file_path)
+		self._check_position(file_path, line, column)
+		resp = await self._request(
+			"textDocument/prepareRename",
+			{"textDocument": {"uri": uri}, "position": {"line": line - 1, "character": column - 1}},
+		)
+		result = resp.get("result")
+		if not result:
+			return None
+		return result if "range" in result else {"range": result}
+
+	async def rename(self, file_path: str, line: int, column: int, new_name: str) -> dict[str, Any] | None:
+		"""The `WorkspaceEdit` renaming the symbol at the position (not applied anywhere)."""
+		uri = await self.ensure_open(file_path)
+		self._check_position(file_path, line, column)
+		resp = await self._request(
+			"textDocument/rename",
+			{
+				"textDocument": {"uri": uri},
+				"position": {"line": line - 1, "character": column - 1},
+				"newName": new_name,
+			},
+		)
+		return resp.get("result")
+
+	async def code_actions(
+		self,
+		file_path: str,
+		start: tuple[int, int],
+		end: tuple[int, int],
+		diagnostics: list[dict[str, Any]] | None = None,
+		only: list[str] | None = None,
+	) -> list[dict[str, Any]]:
+		"""Code actions for a range; `start`/`end` are 1-based (line, column) like the other calls."""
+		uri = await self.ensure_open(file_path)
+		context: dict[str, Any] = {"diagnostics": diagnostics or []}
+		if only:
+			context["only"] = only
+		resp = await self._request(
+			"textDocument/codeAction",
+			{
+				"textDocument": {"uri": uri},
+				"range": {
+					"start": {"line": start[0] - 1, "character": start[1] - 1},
+					"end": {"line": end[0] - 1, "character": end[1] - 1},
+				},
+				"context": context,
+			},
+		)
+		return resp.get("result") or []
+
+	async def signature_help(self, file_path: str, line: int, column: int) -> dict[str, Any]:
+		uri = await self.ensure_open(file_path)
+		self._check_position(file_path, line, column)
+		resp = await self._request(
+			"textDocument/signatureHelp",
+			{"textDocument": {"uri": uri}, "position": {"line": line - 1, "character": column - 1}},
+		)
+		return resp.get("result") or {}
+
+	async def subtypes(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+		resp = await self._request("typeHierarchy/subtypes", {"item": item})
+		return resp.get("result") or []
+
+	# -- simulation overlays ---------------------------------------------------
+
+	def _show_text(self, uri: str, text: str) -> None:
+		known = self._open_files.get(uri)
+		self._diag_events[uri] = asyncio.Event()
+		self._diagnostics.pop(uri, None)
+		if known is None:
+			version = 1
+			self._notify(
+				"textDocument/didOpen",
+				{
+					"textDocument": {
+						"uri": uri,
+						"languageId": self._language_id_for(Path(_uri_to_path(uri))),
+						"version": version,
+						"text": text,
+					}
+				},
+			)
+		else:
+			version = known.version + 1
+			self._notify(
+				"textDocument/didChange",
+				{"textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": text}]},
+			)
+		self._open_files[uri] = OpenFile(uri=uri, version=version, mtime_ns=_OVERLAY_MTIME, size=len(text))
+		self._overlays[uri] = text
+
+	@contextlib.asynccontextmanager
+	async def overlay(self, texts: dict[Path, str]) -> AsyncIterator[None]:
+		"""Show the server `texts` (path -> content, files that may not exist yet
+		included) in place of the disk's, so `diagnostics()` and friends answer for
+		an edit that hasn't been written. The disk is never touched; on exit the
+		server goes back to what is on disk. Other tool calls wait in `refresh()`
+		until the overlay ends, so they never see simulated text.
+		"""
+		async with self._overlay_lock:
+			uris = []
+			try:
+				for path, text in texts.items():
+					uri = self._to_uri(str(path)).as_uri()
+					self._show_text(uri, text)
+					uris.append(uri)
+				yield
+			finally:
+				for uri in uris:
+					self._overlays.pop(uri, None)
+				for uri in uris:
+					path = Path(_uri_to_path(uri))
+					if path.exists():
+						await self.ensure_open(str(path))
+					else:
+						await self.close_document(uri)
 
 	# -- scratch (in-memory-only) documents -----------------------------------
 	#

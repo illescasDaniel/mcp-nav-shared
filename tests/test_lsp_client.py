@@ -762,3 +762,157 @@ def test_given_started_client_when_restart_then_state_reset_and_on_restart_runs(
 	assert client._diagnostics == {}
 	assert client._symbol_cache == {}
 	assert seen == [client]
+
+
+# -- overlays and write-side calls ------------------------------------------------
+
+
+def _notify_recording_client(tmp_path: Path) -> tuple[LspClient, list[tuple[str, dict]]]:
+	client = _started_client(tmp_path)
+	sent: list[tuple[str, dict]] = []
+	client._notify = lambda method, params: sent.append((method, params))  # type: ignore[method-assign]
+	return client, sent
+
+
+def test_given_overlay_when_active_then_ensure_open_keeps_simulated_text_and_exit_restores_disk(tmp_path):
+	# given
+	src = tmp_path / "a.py"
+	src.write_text("x = 1\n", encoding="utf-8")
+	client, sent = _notify_recording_client(tmp_path)
+
+	async def _run() -> None:
+		await client.ensure_open(str(src))
+		sent.clear()
+		async with client.overlay({src: "x = 2\n"}):
+			await client.ensure_open(str(src))  # must not re-read the disk
+			assert [m for m, _ in sent] == ["textDocument/didChange"]
+			assert sent[0][1]["contentChanges"] == [{"text": "x = 2\n"}]
+		# then — back on the disk's text
+		assert sent[-1][0] == "textDocument/didChange"
+		assert sent[-1][1]["contentChanges"] == [{"text": "x = 1\n"}]
+		assert client._overlays == {}
+
+	# when / then
+	asyncio.run(_run())
+
+
+def test_given_overlay_of_new_file_when_exit_then_document_closed(tmp_path):
+	# given
+	client, sent = _notify_recording_client(tmp_path)
+	ghost = tmp_path / "new.py"
+
+	async def _run() -> None:
+		async with client.overlay({ghost: "y = 1\n"}):
+			assert sent[0][0] == "textDocument/didOpen"
+			assert ghost.resolve().as_uri() in client._open_files
+		assert sent[-1][0] == "textDocument/didClose"
+		assert client._open_files == {}
+
+	# when / then
+	asyncio.run(_run())
+
+
+def test_given_active_overlay_when_refresh_then_it_waits_until_overlay_ends(tmp_path):
+	# given
+	src = tmp_path / "a.py"
+	src.write_text("x = 1\n", encoding="utf-8")
+	client, _sent = _notify_recording_client(tmp_path)
+	order: list[str] = []
+
+	async def _run() -> None:
+		async def _refresher() -> None:
+			await client.refresh()
+			order.append("refreshed")
+
+		async with client.overlay({src: "x = 2\n"}):
+			task = asyncio.create_task(_refresher())
+			await asyncio.sleep(0.05)
+			order.append("overlay still active")
+		await task
+
+	# when
+	asyncio.run(_run())
+	# then
+	assert order == ["overlay still active", "refreshed"]
+
+
+def test_given_exception_inside_overlay_when_exit_then_overlay_still_cleared(tmp_path):
+	# given
+	src = tmp_path / "a.py"
+	src.write_text("x = 1\n", encoding="utf-8")
+	client, _sent = _notify_recording_client(tmp_path)
+
+	async def _run() -> None:
+		with pytest.raises(RuntimeError):
+			async with client.overlay({src: "x = 2\n"}):
+				raise RuntimeError("boom")
+		assert client._overlays == {}
+		assert not client._overlay_lock.locked()
+
+	# when / then
+	asyncio.run(_run())
+
+
+def test_given_rename_when_called_then_sends_zero_based_position_and_returns_edit(tmp_path, monkeypatch):
+	# given
+	src = tmp_path / "a.py"
+	src.write_text("def foo():\n\tpass\n", encoding="utf-8")
+	client, _sent = _notify_recording_client(tmp_path)
+	seen: list[tuple[str, dict]] = []
+
+	async def _fake(method: str, params: dict, timeout: float = 20) -> dict:
+		seen.append((method, params))
+		return {"result": {"changes": {}}}
+
+	monkeypatch.setattr(client, "_request", _fake)
+	# when
+	result = asyncio.run(client.rename(str(src), 1, 5, "bar"))
+	# then
+	assert result == {"changes": {}}
+	assert seen[0][0] == "textDocument/rename"
+	assert seen[0][1]["position"] == {"line": 0, "character": 4}
+	assert seen[0][1]["newName"] == "bar"
+
+
+def test_given_prepare_rename_variants_when_called_then_normalised(tmp_path, monkeypatch):
+	# given
+	src = tmp_path / "a.py"
+	src.write_text("def foo():\n\tpass\n", encoding="utf-8")
+	client, _sent = _notify_recording_client(tmp_path)
+	rng = {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 7}}
+	answers = iter([None, rng, {"range": rng, "placeholder": "foo"}])
+
+	async def _fake(method: str, params: dict, timeout: float = 20) -> dict:
+		return {"result": next(answers)}
+
+	monkeypatch.setattr(client, "_request", _fake)
+
+	async def _run() -> list:
+		return [await client.prepare_rename(str(src), 1, 5) for _ in range(3)]
+
+	# when
+	none, bare, full = asyncio.run(_run())
+	# then
+	assert none is None
+	assert bare == {"range": rng}
+	assert full["placeholder"] == "foo"
+
+
+def test_given_code_actions_when_called_then_range_converted_and_only_forwarded(tmp_path, monkeypatch):
+	# given
+	src = tmp_path / "a.py"
+	src.write_text("os.getcwd()\n", encoding="utf-8")
+	client, _sent = _notify_recording_client(tmp_path)
+	seen: list[dict] = []
+
+	async def _fake(method: str, params: dict, timeout: float = 20) -> dict:
+		seen.append(params)
+		return {"result": [{"title": "import os"}]}
+
+	monkeypatch.setattr(client, "_request", _fake)
+	# when
+	actions = asyncio.run(client.code_actions(str(src), (1, 1), (1, 3), diagnostics=[{"code": "x"}], only=["quickfix"]))
+	# then
+	assert actions == [{"title": "import os"}]
+	assert seen[0]["range"] == {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}
+	assert seen[0]["context"] == {"diagnostics": [{"code": "x"}], "only": ["quickfix"]}
