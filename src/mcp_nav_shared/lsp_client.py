@@ -78,6 +78,13 @@ class InvalidPositionError(ValueError):
 _LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
 
 
+def _read_document_text(path: Path) -> str:
+	"""A file's text as an editor would hold it: a UTF-8 byte order mark is not part of the
+	document, and counting it would shift every column on the first line by one."""
+	text = path.read_text(encoding="utf-8")
+	return text[1:] if text.startswith("\ufeff") else text
+
+
 def _uri_to_path(uri: str) -> str:
 	path = urlparse(uri).path
 	return unquote(path.lstrip("/") if os.name == "nt" else path)
@@ -390,7 +397,7 @@ class LspClient:
 		known = self._open_files.get(uri)
 		if known is not None and known.mtime_ns == stat.st_mtime_ns and known.size == stat.st_size:
 			return uri
-		text = abs_path.read_text(encoding="utf-8")
+		text = _read_document_text(abs_path)
 		self._diag_events[uri] = asyncio.Event()
 		# The previous version's pushed diagnostics describe text that no longer
 		# exists; keeping them would resurface fixed errors as a "cache fallback".
@@ -559,7 +566,7 @@ class LspClient:
 		"""Reject a position outside the file, so a typo isn't answered with an
 		empty result indistinguishable from "nothing there"."""
 		abs_path = self._to_uri(file_path)
-		lines = _LINE_BREAK_RE.split(abs_path.read_text(encoding="utf-8"))
+		lines = _LINE_BREAK_RE.split(_read_document_text(abs_path))
 		if len(lines) > 1 and lines[-1] == "":
 			lines.pop()  # the empty "line" after the final newline isn't a line anyone can point at
 		if not 1 <= line <= len(lines):
@@ -781,25 +788,60 @@ class LspClient:
 		self._open_files[uri] = OpenFile(uri=uri, version=version, mtime_ns=_OVERLAY_MTIME, size=len(text))
 		self._overlays[uri] = text
 
+	def _materialize(self, path: Path, text: str) -> list[Path]:
+		"""Write a file that doesn't exist yet (and any missing parent directories); returns the
+		directories created, outermost first. Language servers find modules on disk, so an
+		import of a new file only resolves once the file is really there."""
+		created_dirs: list[Path] = []
+		for parent in reversed(path.parents):
+			if not parent.exists():
+				created_dirs.append(parent)
+		path.parent.mkdir(parents=True, exist_ok=True)
+		path.write_bytes(text.encode("utf-8"))
+		return created_dirs
+
 	@contextlib.asynccontextmanager
 	async def overlay(self, texts: dict[Path, str]) -> AsyncIterator[None]:
-		"""Show the server `texts` (path -> content, files that may not exist yet
-		included) in place of the disk's, so `diagnostics()` and friends answer for
-		an edit that hasn't been written. The disk is never touched; on exit the
-		server goes back to what is on disk. Other tool calls wait in `refresh()`
-		until the overlay ends, so they never see simulated text.
+		"""Show the server `texts` (path -> content) in place of the disk's, so `diagnostics()` and
+		friends answer for an edit that hasn't been written. Existing files are never touched. A
+		path that doesn't exist yet is written to disk for the duration only (the server resolves
+		imports through the file system) and removed again, with any directories it needed, before
+		the overlay ends, even on errors. Other tool calls wait in `refresh()` until then, so they
+		never see simulated text or the transient files.
 		"""
 		async with self._overlay_lock:
-			uris = []
+			uris: list[str] = []
+			transient: list[Path] = []
+			created_dirs: list[Path] = []
 			try:
 				for path, text in texts.items():
-					uri = self._to_uri(str(path)).as_uri()
+					target = self._to_uri(str(path))
+					if not target.exists():
+						created_dirs += self._materialize(target, text)
+						transient.append(target)
+					uri = target.as_uri()
 					self._show_text(uri, text)
 					uris.append(uri)
+				if transient:
+					self._notify(
+						"workspace/didChangeWatchedFiles",
+						{"changes": [{"uri": p.as_uri(), "type": _FILE_CREATED} for p in transient]},
+					)
 				yield
 			finally:
 				for uri in uris:
 					self._overlays.pop(uri, None)
+				for target in transient:
+					with contextlib.suppress(OSError):
+						target.unlink()
+				for directory in reversed(created_dirs):
+					with contextlib.suppress(OSError):
+						directory.rmdir()
+				if transient:
+					self._notify(
+						"workspace/didChangeWatchedFiles",
+						{"changes": [{"uri": p.as_uri(), "type": _FILE_DELETED} for p in transient]},
+					)
 				for uri in uris:
 					path = Path(_uri_to_path(uri))
 					if path.exists():

@@ -796,17 +796,54 @@ def test_given_overlay_when_active_then_ensure_open_keeps_simulated_text_and_exi
 	asyncio.run(_run())
 
 
-def test_given_overlay_of_new_file_when_exit_then_document_closed(tmp_path):
+def test_given_overlay_of_new_file_when_active_then_file_exists_on_disk_and_is_gone_after(tmp_path):
 	# given
 	client, sent = _notify_recording_client(tmp_path)
-	ghost = tmp_path / "new.py"
+	ghost = tmp_path / "newpkg" / "deeper" / "new.py"
 
 	async def _run() -> None:
 		async with client.overlay({ghost: "y = 1\n"}):
-			assert sent[0][0] == "textDocument/didOpen"
+			# the language server resolves imports through the file system, so the file is really there
+			assert ghost.read_text() == "y = 1\n"
 			assert ghost.resolve().as_uri() in client._open_files
-		assert sent[-1][0] == "textDocument/didClose"
+			kinds = [m for m, _ in sent]
+			assert kinds[0] == "textDocument/didOpen" and "workspace/didChangeWatchedFiles" in kinds
+		# then — file, the directories it needed, and the document are all gone
+		assert not ghost.exists() and not (tmp_path / "newpkg").exists()
+		assert sent[-1][0] == "textDocument/didClose" or sent[-2][0] == "workspace/didChangeWatchedFiles"
 		assert client._open_files == {}
+		deletes = [p for m, p in sent if m == "workspace/didChangeWatchedFiles" and p["changes"][0]["type"] == 3]
+		assert len(deletes) == 1
+
+	# when / then
+	asyncio.run(_run())
+
+
+def test_given_error_inside_overlay_of_new_file_when_exit_then_transient_file_still_removed(tmp_path):
+	# given
+	client, _sent = _notify_recording_client(tmp_path)
+	ghost = tmp_path / "pkg" / "new.py"
+
+	async def _run() -> None:
+		with pytest.raises(RuntimeError):
+			async with client.overlay({ghost: "y = 1\n"}):
+				raise RuntimeError("boom")
+		assert not ghost.exists() and not (tmp_path / "pkg").exists()
+
+	# when / then
+	asyncio.run(_run())
+
+
+def test_given_existing_directory_when_overlay_new_file_then_directory_kept(tmp_path):
+	# given
+	(tmp_path / "pkg").mkdir()
+	(tmp_path / "pkg" / "keep.py").write_text("k = 1\n", encoding="utf-8")
+	client, _sent = _notify_recording_client(tmp_path)
+
+	async def _run() -> None:
+		async with client.overlay({tmp_path / "pkg" / "new.py": "y = 1\n"}):
+			pass
+		assert (tmp_path / "pkg" / "keep.py").exists() and not (tmp_path / "pkg" / "new.py").exists()
 
 	# when / then
 	asyncio.run(_run())
@@ -916,3 +953,17 @@ def test_given_code_actions_when_called_then_range_converted_and_only_forwarded(
 	assert actions == [{"title": "import os"}]
 	assert seen[0]["range"] == {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}
 	assert seen[0]["context"] == {"diagnostics": [{"code": "x"}], "only": ["quickfix"]}
+
+
+def test_given_file_with_bom_when_ensure_open_then_document_text_has_no_bom(tmp_path):
+	# given — a BOM counted as a character would shift every first-line column by one
+	src = tmp_path / "a.py"
+	src.write_bytes(b"\xef\xbb\xbfx = 1\n")
+	client, sent = _notify_recording_client(tmp_path)
+	# when
+	asyncio.run(client.ensure_open(str(src)))
+	# then
+	assert sent[0][1]["textDocument"]["text"] == "x = 1\n"
+	client._check_position(str(src), 1, 6)  # end of `x = 1`: column 6 is valid only if the BOM isn't counted
+	with pytest.raises(lsp_client.InvalidPositionError):
+		client._check_position(str(src), 1, 7)
