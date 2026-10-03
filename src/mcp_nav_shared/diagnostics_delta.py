@@ -14,6 +14,7 @@ from typing import Any
 
 _SEVERITY_LABELS = {1: "error", 2: "warning", 3: "info", 4: "hint"}
 ERROR_SEVERITY = 1
+HINT_SEVERITY = 4
 
 
 @dataclass(frozen=True)
