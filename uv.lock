@@ -395,7 +395,7 @@ wheels = [
 
 [[package]]
 name = "mcp-nav-shared"
-version = "0.1.1"
+version = "0.2.0"
 source = { editable = "." }
 
 [package.dev-dependencies]
