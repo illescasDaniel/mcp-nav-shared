@@ -1076,6 +1076,20 @@ class LspClient:
 							paths.append(relative.as_posix())
 					except ValueError:
 						pass
+				# Directories the dead preview created and left empty: an empty directory is safe to
+				# remove (rmdir refuses anything with content), unlike a file whose ownership is unknown.
+				dirs = entry.get("created_dirs")
+				if isinstance(dirs, list):
+					for value in reversed(dirs):
+						if not isinstance(value, str):
+							continue
+						try:
+							directory = Path(value)
+							directory.relative_to(root)
+						except ValueError:
+							continue
+						with contextlib.suppress(OSError):
+							directory.rmdir()
 			if paths:
 				message = "An interrupted preview may have left files; inspect these workspace paths: " + ", ".join(
 					sorted(set(paths))
@@ -1085,6 +1099,57 @@ class LspClient:
 					self.on_notice(message)
 			if len(kept) != len(entries):
 				self._manifest_write(kept, manifest)
+
+	def _free_sibling_name(self, target: Path) -> Path:
+		"""A private, unused sibling name to move a preview file to before deciding its fate."""
+		base = f".{target.name}.mcp-nav-preview-{os.getpid()}"
+		candidate = target.with_name(base)
+		number = 0
+		while candidate.exists() or candidate.is_symlink():
+			number += 1
+			candidate = target.with_name(f"{base}-{number}")
+		return candidate
+
+	def _discard_if_ours(self, target: Path, identity: tuple[int, int, str]) -> bool:
+		"""Remove the transient preview file iff the path still holds the exact bytes that were created.
+
+		The file is renamed to a private sibling name first: that one atomic step takes ownership of whatever
+		sits at the path, so a user file that replaces the target between the check and the deletion can never
+		be unlinked. Content that turns out not to be ours is renamed back untouched (fail closed: the file is
+		kept with a warning when it cannot be isolated or removed).
+		"""
+		dev, inode, sha = identity
+		if target.is_symlink():
+			return False
+		stolen = self._free_sibling_name(target)
+		try:
+			os.rename(target, stolen)
+		except OSError:
+			logger.warning("could not isolate the preview file; it is left in place", exc_info=True)
+			return False
+		try:
+			info = stolen.stat()
+			if (info.st_dev, info.st_ino) == (dev, inode) and _sha1(stolen.read_bytes()) == sha:
+				stolen.unlink()
+				return True
+			if target.exists() or target.is_symlink():
+				# the user created something new at the path while we held the old file: keep both
+				# (renaming back would replace their file — deletion must never rest on a guess)
+				keep = self._free_sibling_name(target)
+				os.rename(stolen, keep)
+				logger.warning(
+					"the preview path %s was recreated during cleanup; the transient is kept at %s",
+					target.name,
+					keep.name,
+				)
+				return False
+			os.rename(stolen, target)  # not ours (any more): restore it for the user
+			return False
+		except FileNotFoundError:
+			return True
+		except OSError:
+			logger.warning("could not remove the preview file; it is left at %s", stolen.name, exc_info=True)
+			return False
 
 	def _missing_parents(self, path: Path) -> list[Path]:
 		"""Directories above `path` that don't exist yet, outermost first."""
@@ -1164,18 +1229,8 @@ class LspClient:
 						self._overlays.pop(uri, None)
 					completed: list[Path] = []
 					for target in transient:
-						try:
-							if (
-								not target.is_symlink()
-								and (target.stat().st_dev, target.stat().st_ino) == owned[target][:2]
-								and _sha1(target.read_bytes()) == owned[target][2]
-							):
-								target.unlink()
-							completed.append(target)
-						except FileNotFoundError:
-							completed.append(target)
-						except OSError:
-							logger.warning("could not remove preview file", exc_info=True)
+						self._discard_if_ours(target, owned[target])
+						completed.append(target)
 					for directory in reversed(created_dirs):
 						with contextlib.suppress(OSError):
 							directory.rmdir()
