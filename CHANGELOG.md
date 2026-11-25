@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.3.0
+## 1.0.0
 
-Hardening release from the codenav-mcp v1.0 black-box QA campaign (24 reviewed fix blocks). Test suite: 219 → 395 tests.
+Stable release from the codenav-mcp v1.0 black-box QA campaign (24 reviewed fix blocks; API frozen). Test suite: 219 → 395 tests.
 
 ### Added
 - `LspClient.diagnostics_with_open_files(...)`: opens created documents and gathers diagnostics under one reader
