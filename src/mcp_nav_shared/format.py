@@ -5,11 +5,13 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from mcp_nav_shared.edits import split_lines
 from mcp_nav_shared.errors import ToolInputError
 
 
@@ -68,7 +70,7 @@ def uri_to_relative(uri: str, workspace_root: Path) -> str:
 
 @lru_cache(maxsize=128)
 def _read_lines_cached(path: str, mtime_ns: int, size: int) -> tuple[str, ...]:
-	return tuple(Path(path).read_text(encoding="utf-8").splitlines())
+	return tuple(split_lines(Path(path).read_text(encoding="utf-8")))
 
 
 def _read_lines(path: Path) -> tuple[str, ...] | None:
@@ -254,17 +256,27 @@ def rank_workspace_symbols(symbols: list[dict[str, Any]], query: str) -> list[di
 	ty's workspace/symbol is fuzzy (`LspClient` also matches long test names
 	containing those letters in order) and returns hits in workspace order, so
 	without ranking the exact match can land past the result cap.
+
+	The order is total: the remaining ties go by file path, then line and column,
+	so two processes return the same list for the same workspace (ty's own order
+	varies between runs).
 	"""
 	if not query:
-		return list(symbols)
+		return sorted(symbols, key=_symbol_total_key)
 	return sorted(
 		symbols,
 		key=lambda sym: (
 			_match_tier(str(sym.get("name") or ""), query),
 			_is_test_path(_symbol_file_key(sym)),
 			sym.get("kind") in _LOW_PRIORITY_KINDS,
+			*_symbol_total_key(sym),
 		),
 	)
+
+
+def _symbol_total_key(sym: dict[str, Any]) -> tuple[str, int, int]:
+	uri, line, column = workspace_symbol_position(sym)
+	return uri, line, column
 
 
 def _symbol_file_key(sym: dict[str, Any]) -> str:
@@ -362,10 +374,7 @@ def format_workspace_symbols(
 	fuzzy: bool = False,
 ) -> str:
 	"""Ranked, capped listing. Unless `fuzzy`, loose subsequence-only hits
-	(tier 4) are hidden whenever the name really contains the query somewhere
-	(tiers 0–3): language servers pad `_probe` with every long test name that
-	happens to contain those letters in order, which reads as if they all
-	matched. With no real match the fuzzy hits stay (abbreviations like `LspCl`)."""
+	(tier 4) are hidden and counted. With fuzzy=true, those hits are listed and marked."""
 	if not symbols:
 		return ""
 	ranked = filter_workspace_symbols(rank_workspace_symbols(symbols, query))
@@ -375,8 +384,15 @@ def format_workspace_symbols(
 		if real:
 			hidden_fuzzy = len(ranked) - len(real)
 			ranked = real
+		else:
+			# Only loose fuzzy hits: counted, not listed (fuzzy=true lists them, marked).
+			count = len(ranked)
+			return (
+				f"No exact match: {count} looser fuzzy match{'es' if count != 1 else ''} whose names don't contain "
+				f"{query!r} hidden; pass fuzzy=true to list them (marked fuzzy)."
+			)
 	shown = ranked[: max(0, limit)]
-	lines = [format_workspace_symbol(sym, workspace_root) for sym in shown]
+	lines = [_marked(sym, workspace_root, query, fuzzy) for sym in shown]
 	omitted = len(ranked) - len(shown)
 	if omitted > 0:
 		lines.append(f"… and {omitted} more (showing first {len(shown)}); narrow with kind=… or path=…")
@@ -388,8 +404,45 @@ def format_workspace_symbols(
 	return "\n".join(lines)
 
 
-def format_diagnostic(item: dict[str, Any]) -> str:
-	"""One diagnostic as `L:C [severity code] first line`, with any further
+def _marked(sym: dict[str, Any], workspace_root: Path, query: str, fuzzy: bool) -> str:
+	"""One listing line; with fuzzy=true a loose fuzzy hit (its name does not contain the query) ends in `(fuzzy)`."""
+	line = format_workspace_symbol(sym, workspace_root)
+	if fuzzy and query and _match_tier(str(sym.get("name") or ""), query) >= _FUZZY_TIER:
+		return f"{line}  (fuzzy)"
+	return line
+
+
+NO_EXACT_MATCH_NOTE = "No exact match; showing fuzzy matches (marked fuzzy)."
+
+
+def is_inside_workspace(uri: str, workspace_root: Path) -> bool:
+	"""True when the file behind `uri` lies under the workspace (a symlinked root counts too).
+	An empty uri is kept: there is no path to judge it by."""
+	if not uri:
+		return True
+	path = uri_to_path(uri)
+	if path.is_relative_to(workspace_root):
+		return True
+	return path.resolve().is_relative_to(workspace_root.resolve())
+
+
+def split_inside_workspace(
+	items: list[dict[str, Any]], workspace_root: Path, uri_of: Callable[[dict[str, Any]], str]
+) -> tuple[list[dict[str, Any]], int]:
+	"""(items inside the workspace, how many were outside). Library and site-packages hits never reach the reply."""
+	inside = [item for item in items if is_inside_workspace(uri_of(item), workspace_root)]
+	return inside, len(items) - len(inside)
+
+
+def outside_workspace_note(count: int) -> str:
+	"""The line that says results were dropped for lying outside the workspace; empty when none were."""
+	if count <= 0:
+		return ""
+	return f"{count} result(s) outside the workspace were not shown."
+
+
+def format_diagnostic(item: dict[str, Any], *, path: str | None = None) -> str:
+	"""One diagnostic as `path:L:C [severity code] first line` (the path only when given), with any further
 	message lines (e.g. ty's `Code is unreachable` / `This may depend on your
 	current environment and settings` two-liner) indented on their own lines
 	so every line that doesn't start with whitespace is exactly one diagnostic."""
@@ -399,18 +452,21 @@ def format_diagnostic(item: dict[str, Any]) -> str:
 	code = item.get("code")
 	tag = f"{severity} {code}" if code not in (None, "") else severity
 	lines = str(item.get("message", "")).splitlines() or [""]
-	header = f"{start.get('line', 0) + 1}:{start.get('character', 0) + 1} [{tag}] {lines[0]}"
+	position = f"{start.get('line', 0) + 1}:{start.get('character', 0) + 1}"
+	header = f"{path}:{position} [{tag}] {lines[0]}" if path else f"{position} [{tag}] {lines[0]}"
 	return "\n".join([header, *(f"    {line}" for line in lines[1:])])
 
 
-def format_diagnostics(items: list[dict[str, Any]], *, limit: int = DEFAULT_DIAGNOSTICS_LIMIT) -> str:
+def format_diagnostics(
+	items: list[dict[str, Any]], *, limit: int = DEFAULT_DIAGNOSTICS_LIMIT, path: str | None = None
+) -> str:
 	"""Format LSP diagnostics, capped like `format_workspace_symbols` so a badly
 	broken file (or one mis-parsed as the wrong language) can't flood the
-	caller with an unbounded wall of text."""
+	caller with an unbounded wall of text. `path` (workspace-relative) prefixes every line."""
 	if not items:
 		return "No diagnostics."
 	shown = items[: max(0, limit)]
-	lines = [format_diagnostic(item) for item in shown]
+	lines = [format_diagnostic(item, path=path) for item in shown]
 	omitted = len(items) - len(shown)
 	if omitted > 0:
 		lines.append(f"… and {omitted} more (showing first {len(shown)})")
@@ -418,6 +474,41 @@ def format_diagnostics(items: list[dict[str, Any]], *, limit: int = DEFAULT_DIAG
 
 
 DEFAULT_REFERENCE_FILE_LIMIT = 25
+DEFAULT_REFERENCES_LIMIT = 200  # hits listed by `references`; the count line always gives the exact total
+DEFAULT_REFERENCES_SNIPPET_LIMIT = 8
+
+
+def _location_order_key(loc: dict[str, Any], workspace_root: Path) -> tuple[bool, str, int, int]:
+	"""Production files before tests, then path, line and column: a total order, so a capped list is stable."""
+	uri = loc.get("uri") or loc.get("targetUri", "")
+	rel = uri_to_relative(uri, workspace_root)
+	start = _location_range(loc).get("start") or {}
+	return (_is_test_path(rel), rel, int(start.get("line", 0)), int(start.get("character", 0)))
+
+
+def _group_by_file(locations: list[dict[str, Any]], workspace_root: Path) -> dict[str, set[tuple[int, int]]]:
+	groups: dict[str, set[tuple[int, int]]] = {}
+	for loc in locations:
+		uri = loc.get("uri") or loc.get("targetUri", "")
+		rng = _location_range(loc)
+		start = rng.get("start") or {}
+		start_line = int(start.get("line", 0)) + 1
+		start_col = int(start.get("character", 0)) + 1
+		groups.setdefault(uri_to_relative(uri, workspace_root), set()).add((start_line, start_col))
+	return groups
+
+
+def _grouped_lines(groups: dict[str, set[tuple[int, int]]], *, file_limit: int, with_columns: bool) -> list[str]:
+	def _tag(line: int, col: int) -> str:
+		return f"L{line}:{col}" if with_columns else f"L{line}"
+
+	files = sorted(groups.items(), key=lambda entry: (_is_test_path(entry[0]), entry[0]))
+	shown = files[:file_limit]
+	lines = [f"{path}: " + ", ".join(_tag(n, c) for n, c in sorted(nums)) for path, nums in shown]
+	omitted = len(files) - len(shown)
+	if omitted > 0:
+		lines.append(f"… and {omitted} more file(s)")
+	return lines
 
 
 def format_references_grouped(
@@ -436,31 +527,10 @@ def format_references_grouped(
 	(hover/definition) can still target the hit precisely."""
 	if not locations:
 		return "No references found."
-	groups: dict[str, set[tuple[int, int]]] = {}
-	for loc in locations:
-		uri = loc.get("uri") or loc.get("targetUri", "")
-		rng = _location_range(loc)
-		start = rng.get("start") or {}
-		start_line = int(start.get("line", 0)) + 1
-		start_col = int(start.get("character", 0)) + 1
-		rel = uri_to_relative(uri, workspace_root)
-		groups.setdefault(rel, set()).add((start_line, start_col))
+	groups = _group_by_file(locations, workspace_root)
 	total = sum(len(nums) for nums in groups.values())
-	files = sorted(groups.items())
-	shown = files[:file_limit]
-
-	def _tag(line: int, col: int) -> str:
-		return f"L{line}:{col}" if with_columns else f"L{line}"
-
-	lines = [f"{total} reference(s) in {len(files)} file(s):"]
-	lines += [f"{path}: " + ", ".join(_tag(n, c) for n, c in sorted(nums)) for path, nums in shown]
-	omitted = len(files) - len(shown)
-	if omitted > 0:
-		lines.append(f"… and {omitted} more file(s)")
-	return "\n".join(lines)
-
-
-DEFAULT_REFERENCES_SNIPPET_LIMIT = 8
+	header = f"{total} reference(s) in {len(groups)} file(s):"
+	return "\n".join([header, *_grouped_lines(groups, file_limit=file_limit, with_columns=with_columns)])
 
 
 def format_references(
@@ -468,17 +538,27 @@ def format_references(
 	workspace_root: Path,
 	*,
 	snippet_limit: int = DEFAULT_REFERENCES_SNIPPET_LIMIT,
+	limit: int = DEFAULT_REFERENCES_LIMIT,
 ) -> str:
-	"""Full per-location snippets (`format_location`) for a small number of
-	hits; above `snippet_limit`, falls back to the compact grouped listing
-	(`format_references_grouped`, with columns) so a symbol like `showView`
-	with 20+ call sites doesn't flood the reply with 100+ lines of context."""
+	"""The exact count line first (`N reference(s) in M file(s):`, even for one hit), then the hits in
+	`_location_order_key` order: full per-location snippets (`format_location`) for at most `snippet_limit`
+	hits, otherwise the compact grouped listing (with columns). Hits beyond `limit` are counted, not listed."""
 	if not locations:
 		return "No references found at that position."
-	if len(locations) <= snippet_limit:
-		return "\n\n".join(format_location(loc, workspace_root) for loc in locations)
-	grouped = format_references_grouped(locations, workspace_root, with_columns=True)
-	return f"(compact list: {len(locations)} > {snippet_limit} hits)\n{grouped}"
+	ordered = sorted(locations, key=lambda loc: _location_order_key(loc, workspace_root))
+	shown = ordered[: max(1, limit)]
+	header = f"{len(ordered)} reference(s) in {len(_group_by_file(ordered, workspace_root))} file(s):"
+	if len(shown) <= snippet_limit:
+		body = ["\n\n".join(format_location(loc, workspace_root) for loc in shown)]
+	else:
+		body = _grouped_lines(
+			_group_by_file(shown, workspace_root), file_limit=DEFAULT_REFERENCE_FILE_LIMIT, with_columns=True
+		)
+	lines = [header, *body]
+	omitted = len(ordered) - len(shown)
+	if omitted > 0:
+		lines.append(f"… {omitted} more omitted; raise limit= to see them")
+	return "\n".join(lines)
 
 
 def is_hierarchical_document_symbols(symbols: list[dict[str, Any]]) -> bool:
@@ -557,13 +637,18 @@ LOCALS_HOLDER_KINDS = frozenset({6, 9, 12, 13, 14})
 
 
 def format_outline(
-	symbols: list[dict[str, Any]], *, indent: str = "  ", collapse_kinds: frozenset[int] = frozenset()
+	symbols: list[dict[str, Any]],
+	*,
+	indent: str = "  ",
+	collapse_kinds: frozenset[int] = frozenset(),
+	max_depth: int | None = None,
 ) -> str:
 	"""Indented `name  [Kind]  :start-end` tree, from either shape
 	`documentSymbol` can return (see `is_hierarchical_document_symbols`).
 	The end line lets an agent judge a member's size (e.g. "is this method
 	worth reading in full?") without a separate call. Children of symbols whose
-	kind is in `collapse_kinds` (e.g. `LOCALS_HOLDER_KINDS`) are left out."""
+	kind is in `collapse_kinds` (e.g. `LOCALS_HOLDER_KINDS`) are left out.
+	`max_depth=1` lists only the top-level symbols; `None` lists every level."""
 	if not symbols:
 		return "No symbols found."
 	roots = to_symbol_tree(symbols)
@@ -574,7 +659,7 @@ def format_outline(
 			start, end = node["start_line"] + 1, node["end_line"] + 1
 			span = f":{start}" if start == end else f":{start}-{end}"
 			lines.append(f"{indent * depth}{node['name']}  [{kind}]  {span}")
-			if node["kind"] not in collapse_kinds:
+			if node["kind"] not in collapse_kinds and (max_depth is None or depth + 1 < max_depth):
 				walk(node["children"], depth + 1)
 
 	lines: list[str] = []
@@ -582,15 +667,34 @@ def format_outline(
 	return "\n".join(lines)
 
 
-def format_callers(incoming_calls: list[dict[str, Any]], workspace_root: Path) -> str:
+DEFAULT_CALLERS_LIMIT = 200
+
+
+def _caller_order_key(call: dict[str, Any], workspace_root: Path) -> tuple[bool, str, int, str]:
+	frm = call.get("from") or {}
+	rel = uri_to_relative(frm.get("uri", ""), workspace_root)
+	sel_start = (frm.get("selectionRange") or {}).get("start") or {}
+	return (_is_test_path(rel), rel, int(sel_start.get("line", 0)), str(frm.get("name") or ""))
+
+
+def format_callers(
+	incoming_calls: list[dict[str, Any]],
+	workspace_root: Path,
+	*,
+	limit: int = DEFAULT_CALLERS_LIMIT,
+) -> str:
 	"""`callHierarchy/incomingCalls` results as `caller  [Kind]  (path:line)
 	calls at L.., L..` — the caller's own position plus every call-site line
 	within it, so an agent sees who calls a function without imports/type-only
-	usages mixed in (unlike `references`)."""
+	usages mixed in (unlike `references`). The first line is the exact count of callers
+	and files; at most `limit` callers are listed, in a fixed order."""
 	if not incoming_calls:
 		return "No callers found."
-	lines = []
-	for call in incoming_calls:
+	ordered = sorted(incoming_calls, key=lambda call: _caller_order_key(call, workspace_root))
+	shown = ordered[: max(1, limit)]
+	files = {uri_to_relative((call.get("from") or {}).get("uri", ""), workspace_root) for call in ordered}
+	lines = [f"{len(ordered)} caller(s) in {len(files)} file(s):"]
+	for call in shown:
 		frm = call.get("from") or {}
 		name = str(frm.get("name") or "?")
 		kind = symbol_kind_label(frm.get("kind"))
@@ -600,4 +704,10 @@ def format_callers(incoming_calls: list[dict[str, Any]], workspace_root: Path) -
 		call_site_lines = sorted({int((r.get("start") or {}).get("line", 0)) + 1 for r in call.get("fromRanges") or []})
 		call_sites = ", ".join(f"L{n}" for n in call_site_lines) or f"L{caller_line}"
 		lines.append(f"{name}  [{kind}]  ({rel}:{caller_line}) calls at {call_sites}")
+	omitted = len(ordered) - len(shown)
+	if omitted > 0:
+		lines.append(f"… {omitted} more omitted; raise limit= to see them")
 	return "\n".join(lines)
+
+
+STATIC_CALLERS_NOTE = "Static callers only; overriding methods are not included."

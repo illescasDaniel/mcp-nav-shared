@@ -22,7 +22,8 @@ the servers pin a compatible range.
 | `mcp_nav_shared.edits` | Write-side primitives: LSP `TextEdit`/`WorkspaceEdit` application (UTF-16 columns, CRLF, BOM), whole-file `FileChange`s, diffs, `EditPlan` |
 | `mcp_nav_shared.transaction` | `WriteGuard` (workspace/path/read-only rules), `EditJournal` (stale check, atomic apply with rollback, undo), `PlanStore` for previews |
 | `mcp_nav_shared.diagnostics_delta` | Before/after diagnostics comparison keyed on message + source line, so shifted lines don't look like new errors |
-| `mcp_nav_shared.exclude` | Directory names every scan skips (`.git`, `node_modules`, `.venv`, …) |
+| `mcp_nav_shared.exclude` | Directory names every scan skips (`.git`, `node_modules`, `.venv`, …); `excluded_names(prefix)` adds the names in `<prefix>_EXCLUDE_DIRS` and removes those in `<prefix>_INCLUDE_DIRS` |
+| `mcp_nav_shared.output` | Output cap for tool results: `DEFAULT_MAX_OUTPUT_CHARS`, `max_output_chars()` (reads `CODENAV_MCP_MAX_OUTPUT_CHARS` for codenav) and `cap_output()`, which cuts at a line boundary and appends an omission footer |
 
 ## Development
 

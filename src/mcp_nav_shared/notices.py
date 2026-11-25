@@ -10,11 +10,15 @@ once), so the most it can do about stale code is say so on every call.
 from __future__ import annotations
 
 import functools
+import os
 import time
 import typing
 from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
+
+from mcp_nav_shared.errors import FailedText
+from mcp_nav_shared.output import cap_output
 
 
 _RECHECK_SECONDS = 2.0
@@ -83,8 +87,20 @@ class NoticeBoard:
 
 		@functools.wraps(fn)
 		async def wrapper(*args: Any, **kwargs: Any) -> str:
-			return self.annotate(await fn(*args, **kwargs))
+			value = os.environ.get("CODENAV_MCP_MAX_OUTPUT_CHARS", "")
+			if value and not getattr(self, "_output_config_checked", False):
+				try:
+					valid = int(value) > 0
+				except ValueError:
+					valid = False
+				if not valid:
+					self.post(f"CODENAV_MCP_MAX_OUTPUT_CHARS={value} is not a positive integer; using 30000.")
+				self.__dict__["_output_config_checked"] = True
+			result = await fn(*args, **kwargs)
+			text = self.annotate(cap_output(result))
+			return FailedText(text) if isinstance(result, FailedText) else text
 
+		wrapper.__output_capped__ = True
 		wrapper.__annotations__ = typing.get_type_hints(fn)
 		return wrapper
 

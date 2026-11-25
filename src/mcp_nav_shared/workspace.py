@@ -26,14 +26,32 @@ from urllib.parse import unquote, urlparse
 logger = logging.getLogger(__name__)
 
 
+class WorkspaceConfigError(ValueError):
+	"""A workspace or source-root setting that cannot work. Raised at startup, before anything is scanned."""
+
+
 def describe_workspace_root(explicit_env: str) -> tuple[Path, str]:
 	"""The statically configured workspace root and where it came from
-	(`explicit_env`, `CLAUDE_PROJECT_DIR` or `cwd`)."""
+	(`explicit_env`, `CLAUDE_PROJECT_DIR` or `cwd`).
+
+	Raises `WorkspaceConfigError` for a root that cannot be a project: a filesystem
+	root (`/`), or a folder pinned in `explicit_env` that does not exist."""
 	for key in (explicit_env, "CLAUDE_PROJECT_DIR"):
 		raw = os.environ.get(key)
 		if raw:
-			return Path(raw).expanduser().resolve(), key
-	return Path.cwd().resolve(), "cwd"
+			root, source = Path(raw).expanduser().resolve(), key
+			break
+	else:
+		raw, root, source = "", Path.cwd().resolve(), "cwd"
+	if root.parent == root:
+		raise WorkspaceConfigError(
+			f"refusing to use {root} as the workspace; set {explicit_env} to your project directory"
+		)
+	if source == explicit_env and not root.is_dir():
+		raise WorkspaceConfigError(
+			f"{explicit_env}={raw} is not an existing directory; set it to your project directory"
+		)
+	return root, source
 
 
 def resolve_workspace_root(explicit_env: str) -> Path:
@@ -147,17 +165,36 @@ class WorkspaceSelector:
 		return _root_paths(str(root.uri) for root in result.roots)
 
 
-def resolve_source_root(explicit_env: str, workspace_root: Path) -> Path:
+def _is_src_layout(src: Path) -> bool:
+	"""A `src/` folder that holds importable code: a directory without `__init__.py`
+	that contains at least one package (a folder with `__init__.py`) or module."""
+	if not src.is_dir() or (src / "__init__.py").exists():
+		return False
+	return any(
+		(child / "__init__.py").is_file() if child.is_dir() else child.suffix == ".py" for child in src.iterdir()
+	)
+
+
+def resolve_source_root(explicit_env: str, workspace_root: Path, *, autodetect_src: bool = False) -> Path:
 	"""Root directory for import-path derivation and workspace-wide class
 	scanning (codenav's `implementations`). Not every project keeps its
 	source under `src/`, so default to the workspace root itself (scan
 	everything) rather than assuming a layout; a project that wants a
 	narrower/faster scan sets `explicit_env` (e.g. to `src`) in its MCP
-	server config."""
+	server config. With `autodetect_src` and `explicit_env` unset, a `src/`
+	layout (see `_is_src_layout`) is used instead.
+
+	Raises `WorkspaceConfigError` when `explicit_env` is not a directory inside the
+	workspace: a scan root outside it would bypass the workspace's write guard."""
 	raw = os.environ.get(explicit_env)
 	if raw:
 		path = Path(raw)
-		return path if path.is_absolute() else (workspace_root / path).resolve()
+		path = (path if path.is_absolute() else workspace_root / path).resolve()
+		if not path.is_dir() or not path.is_relative_to(workspace_root.resolve()):
+			raise WorkspaceConfigError(f"{explicit_env}={raw} is not a directory inside the workspace")
+		return path
+	if autodetect_src and _is_src_layout(workspace_root / "src"):
+		return (workspace_root / "src").resolve()
 	return workspace_root
 
 
@@ -167,16 +204,29 @@ def resolve_extra_source_roots(explicit_env: str, workspace_root: Path) -> list[
 	their matches under a separate heading — typically a project's `tests`
 	directory, so test doubles of a port are listed next to its real adapters.
 	Import paths for these are derived from the workspace root (the usual
-	`pythonpath = ["."]` layout: `tests.unit.fakes`). Missing directories are
-	ignored; unset means none."""
+	`pythonpath = ["."]` layout: `tests.unit.fakes`). Entries that are not an
+	existing directory inside the workspace are skipped (see
+	`ignored_extra_source_roots`); unset means none."""
+	return _extra_source_roots(explicit_env, workspace_root)[0]
+
+
+def ignored_extra_source_roots(explicit_env: str, workspace_root: Path) -> list[str]:
+	"""The entries of `explicit_env` that `resolve_extra_source_roots` skipped, as typed."""
+	return _extra_source_roots(explicit_env, workspace_root)[1]
+
+
+def _extra_source_roots(explicit_env: str, workspace_root: Path) -> tuple[list[Path], list[str]]:
+	workspace = workspace_root.resolve()
 	roots: list[Path] = []
+	ignored: list[str] = []
 	for part in os.environ.get(explicit_env, "").split(","):
 		part = part.strip()
 		if not part:
 			continue
 		path = Path(part)
-		path = path if path.is_absolute() else (workspace_root / path)
-		path = path.resolve()
-		if path.is_dir() and path not in roots:
+		path = (path if path.is_absolute() else workspace / path).resolve()
+		if not path.is_dir() or not path.is_relative_to(workspace):
+			ignored.append(part)
+		elif path not in roots:
 			roots.append(path)
-	return roots
+	return roots, ignored

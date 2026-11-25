@@ -60,7 +60,8 @@ def test_given_no_env_when_resolve_workspace_root_then_uses_cwd(tmp_path, monkey
 
 
 def test_given_explicit_source_root_env_when_resolve_source_root_then_used(tmp_path, monkeypatch):
-	# given
+	# given (RC-096: the source root must exist inside the workspace)
+	(tmp_path / "src").mkdir()
 	monkeypatch.setenv("SOME_SOURCE_ROOT", "src")
 	# when
 	root = resolve_source_root("SOME_SOURCE_ROOT", tmp_path)

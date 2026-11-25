@@ -7,9 +7,13 @@ hand-computed position.
 
 from __future__ import annotations
 
+import ast
+import difflib
+import functools
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from mcp_nav_shared.errors import TOOL_ERRORS, ToolInputError
 from mcp_nav_shared.format import (
@@ -19,6 +23,7 @@ from mcp_nav_shared.format import (
 	rank_workspace_symbols,
 	symbol_kind_label,
 	to_symbol_tree,
+	uri_to_path,
 	uri_to_relative,
 	workspace_symbol_position,
 )
@@ -31,9 +36,18 @@ from mcp_nav_shared.lsp_client import LspClient
 # doesn't say which container it belongs to.
 _MEMBER_KINDS = {6, 7, 9}  # Method, Property, Constructor
 
+# How many near-miss names an unknown-name refusal suggests.
+_NEAR_NAME_COUNT = 3
+
+_T = TypeVar("_T")
+
 
 class SymbolResolutionError(ToolInputError):
 	"""No single confident match for a name-based symbol query: not found, or ambiguous."""
+
+
+class SymbolNotFoundError(SymbolResolutionError):
+	"""Nothing in the workspace matches the name (ambiguity is a plain `SymbolResolutionError`)."""
 
 
 @dataclass
@@ -45,6 +59,12 @@ class ResolvedSymbol:
 	column: int  # 0-based
 	range_start_line: int  # 0-based, the symbol's full span (for dotted member lookup)
 	range_end_line: int
+
+
+def _nfkc(text: str) -> str:
+	"""Python identifiers are NFKC-normalised by the parser (`ﬁ` is `fi`), so
+	name comparisons happen on the normalised form."""
+	return unicodedata.normalize("NFKC", text)
 
 
 def _resolved_from_symbol(sym: dict[str, Any]) -> ResolvedSymbol:
@@ -72,6 +92,73 @@ def _member_span(sym: dict[str, Any]) -> tuple[int, int]:
 	rng = (sym.get("location") or {}).get("range") or {}
 	start = int((rng.get("start") or {}).get("line", 0))
 	return start, int((rng.get("end") or {}).get("line", start))
+
+
+# -- overloads -----------------------------------------------------------------
+#
+# ty lists every `@overload` stub next to the implementation, as separate
+# symbols with the same name. A plain name lookup must not stop at the first
+# stub (its body is `...`, so it is no place to edit or read the function).
+
+
+def _is_overload_decorator(node: ast.expr) -> bool:
+	return (isinstance(node, ast.Name) and node.id == "overload") or (
+		isinstance(node, ast.Attribute) and node.attr == "overload"
+	)
+
+
+@functools.lru_cache(maxsize=256)
+def _overload_name_lines_cached(path: str, mtime_ns: int, size: int) -> frozenset[int]:
+	try:
+		tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+	except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
+		return frozenset()
+	return frozenset(
+		node.lineno - 1
+		for node in ast.walk(tree)
+		if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+		and any(_is_overload_decorator(dec) for dec in node.decorator_list)
+	)
+
+
+def _is_overload_at(uri: str, line: int) -> bool:
+	"""True when the `def` whose name sits on 0-based `line` of `uri` is decorated with `@overload`."""
+	path = uri_to_path(uri)
+	try:
+		stat = path.stat()
+	except OSError:
+		return False
+	return line in _overload_name_lines_cached(str(path), stat.st_mtime_ns, stat.st_size)
+
+
+def _without_overload_stubs(items: list[_T], positions: list[tuple[str, int]]) -> list[_T]:
+	"""Drop `@overload` stubs when the same file also has the implementation.
+	A file whose definitions are all stubs keeps only its first one."""
+	flags = [_is_overload_at(uri, line) for uri, line in positions]
+	impl_files = {uri for (uri, _), stub in zip(positions, flags, strict=True) if not stub}
+	kept: list[_T] = []
+	stub_files_kept: set[str] = set()
+	for item, (uri, _), stub in zip(items, positions, flags, strict=True):
+		if not stub:
+			kept.append(item)
+		elif uri in impl_files:
+			continue  # the file's implementation stands in for its stubs
+		elif uri not in stub_files_kept:
+			stub_files_kept.add(uri)
+			kept.append(item)
+	return kept
+
+
+def _selection_line(node: dict[str, Any]) -> int:
+	rng = node.get("selectionRange") or node.get("range") or {}
+	return int((rng.get("start") or {}).get("line", -1))
+
+
+def _pick_member(children: list[dict[str, Any]], name: str, uri: str) -> dict[str, Any] | None:
+	matches = [child for child in children if _nfkc(str(child.get("name"))) == name]
+	if len(matches) <= 1:
+		return matches[0] if matches else None
+	return _without_overload_stubs(matches, [(uri, _selection_line(child)) for child in matches])[0]
 
 
 def _find_named_node(symbols: list[dict[str, Any]], name: str, line: int) -> dict[str, Any] | None:
@@ -180,8 +267,48 @@ async def _format_candidates(client: LspClient, candidates: list[dict[str, Any]]
 	return "\n".join(lines)
 
 
-def _not_found(query: str) -> SymbolResolutionError:
-	return SymbolResolutionError(f"No symbol found matching {query!r}.")
+def _short_text(text: str, limit: int = 40) -> str:
+	"""`repr` of `text`, cut to `limit` characters, so a long input is never echoed back whole."""
+	shown = repr(text)
+	return shown if len(shown) <= limit else f"{shown[: limit - 3]}..."
+
+
+def symbol_name_problem(query: str) -> str | None:
+	"""Why `query` cannot name a symbol, or None: every dot-separated part must be a Python identifier
+	(`Cart.total`, `pkg.mod.func`, `café`). `search_symbol` takes free text and does not use this check."""
+	if all(part.isidentifier() for part in query.split(".")):
+		return None
+	return (
+		f"{_short_text(query)} is not a symbol name: use an identifier such as total, or a dotted name such as "
+		"Cart.total or pkg.module.func (letters, digits and _ only)."
+	)
+
+
+def declares_type_parameter(path: Path, name: str) -> bool:
+	"""True when the Python file at `path` declares `name` as a PEP 695 type parameter (`class Box[T]`,
+	`def f[T]()`, `type Alias[T] = ...`). Unreadable or unparsable files answer False."""
+	try:
+		tree = ast.parse(path.read_text(encoding="utf-8"))
+	except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
+		return False
+	for node in ast.walk(tree):
+		for param in getattr(node, "type_params", None) or []:
+			if getattr(param, "name", None) == name:
+				return True
+	return False
+
+
+def _not_found(query: str, near: list[str] | None = None) -> SymbolNotFoundError:
+	message = f"No symbol found matching {query!r}."
+	if near:
+		message += f" Did you mean: {', '.join(near)}?"
+	return SymbolNotFoundError(message)
+
+
+def _near_names(query: str, symbols: list[dict[str, Any]]) -> list[str]:
+	"""Up to three distinct names the lookup returned as fuzzy hits, closest first."""
+	names = sorted({str(sym.get("name") or "") for sym in symbols} - {""})
+	return difflib.get_close_matches(_nfkc(query), names, n=_NEAR_NAME_COUNT)
 
 
 async def _ambiguous(
@@ -195,9 +322,9 @@ async def _ambiguous(
 		# Narrowing by file_path (or the candidates simply all live in one
 		# file already) still leaves several same-named symbols there — e.g.
 		# a module-level function and a same-named class method — so
-		# file_path alone can't disambiguate further; point at the
-		# position-based escape hatch instead of repeating advice that won't help.
-		hint = "these all live in the same file; use search_symbol to get exact line/column, then hover/definition/references with that position"
+		# file_path alone can't disambiguate further. Position tools take no
+		# line/column in move/change_signature, so point at the qualified name.
+		hint = "these all live in the same file; give file_path= and the qualified name (Class.member) instead"
 	else:
 		hint = "pass file_path to disambiguate"
 	return SymbolResolutionError(
@@ -214,20 +341,25 @@ def _matches_file(sym: dict[str, Any], workspace_root: Path, file_path: str) -> 
 
 async def _exact_candidates(
 	client: LspClient, workspace_root: Path, name: str, *, file_path: str | None
-) -> list[dict[str, Any]]:
-	symbols = await client.workspace_symbol(name)
+) -> tuple[list[dict[str, Any]], list[str]]:
+	"""Symbols named `name` (NFKC-compared), plus near-miss names for a refusal.
+	The query is normalised before ty sees it, so `ﬁ` searches for `fi`."""
+	query = _nfkc(name)
+	symbols = await client.workspace_symbol(query)
 	# Same filter as search_symbol: drop export-list Variable twins and
 	# identical (name, kind, file) dupes so `symbol_info("foo")` isn't
 	# ambiguous between `function foo` and `export { foo }`.
-	ranked = filter_workspace_symbols(rank_workspace_symbols(symbols, name))
-	exact = [s for s in ranked if _match_tier(str(s.get("name") or ""), name) <= 1]
+	ranked = filter_workspace_symbols(rank_workspace_symbols(symbols, query))
+	exact = [s for s in ranked if _match_tier(_nfkc(str(s.get("name") or "")), query) <= 1]
 	# Prefer a case-exact match (tier 0) over a merely case-insensitive one
 	# (tier 1) when both exist, e.g. `repo_root` vs. a `REPO_ROOT` constant
 	# elsewhere in the workspace — an agent asking for the lowercase name
 	# almost always means the exact symbol, not an unrelated same-letters one.
-	case_exact = [s for s in exact if _match_tier(str(s.get("name") or ""), name) == 0]
+	case_exact = [s for s in exact if _match_tier(_nfkc(str(s.get("name") or "")), query) == 0]
 	if case_exact:
 		exact = case_exact
+	if not exact:
+		return [], _near_names(query, symbols)
 	if file_path is not None:
 		narrowed = [s for s in exact if _matches_file(s, workspace_root, file_path)]
 		if exact and not narrowed:
@@ -238,15 +370,16 @@ async def _exact_candidates(
 				f"{await _format_candidates(client, exact, workspace_root)}"
 			)
 		exact = narrowed
-	return exact
+	return exact, []
 
 
 async def _resolve_simple(
 	client: LspClient, workspace_root: Path, query: str, *, file_path: str | None
 ) -> ResolvedSymbol:
-	exact = await _exact_candidates(client, workspace_root, query, file_path=file_path)
+	exact, near = await _exact_candidates(client, workspace_root, query, file_path=file_path)
 	if not exact:
-		raise _not_found(query)
+		raise _not_found(query, near)
+	exact = _without_overload_stubs(exact, [workspace_symbol_position(s)[:2] for s in exact])
 	if len(exact) > 1:
 		raise await _ambiguous(client, query, exact, workspace_root)
 	return _resolved_from_symbol(exact[0])
@@ -257,15 +390,25 @@ async def _resolve_dotted(
 ) -> ResolvedSymbol:
 	# `Outer.Inner.method`: the first segment is looked up workspace-wide, the
 	# rest are walked down through that symbol's document-symbol tree.
-	first, *path = query.split(".")
+	first, *path = (_nfkc(part) for part in query.split("."))
 	member_name = path[-1]
-	container = await _resolve_simple(client, workspace_root, first, file_path=file_path)
+	try:
+		container = await _resolve_simple(client, workspace_root, first, file_path=file_path)
+	except SymbolNotFoundError:
+		if query.count(".") >= 2:
+			# `pkg.mod.func` where `pkg` is no symbol: most likely a module path.
+			module = query.rsplit(".", 1)[0]
+			raise SymbolNotFoundError(
+				f"No symbol found matching {query!r}; {module} looks like a module path; "
+				"give file_path= and the bare name."
+			) from None
+		raise
 	rel_path = uri_to_relative(container.uri, workspace_root)
 	members = await client.document_symbol(rel_path)
 	if is_hierarchical_document_symbols(members):
 		found = _find_named_node(members, container.name, container.line)
 		for part in path:
-			found = next((c for c in (found or {}).get("children") or [] if str(c.get("name")) == part), None)
+			found = _pick_member((found or {}).get("children") or [], part, container.uri)
 		if found is not None:
 			return _resolved_from_hierarchical_node(member_name, found, container.uri)
 	else:
@@ -277,10 +420,12 @@ async def _resolve_dotted(
 			candidates = [
 				m
 				for m in members
-				if str(m.get("name") or "") == part
+				if _nfkc(str(m.get("name") or "")) == part
 				and span[0] <= _member_start_line(m) <= span[1]
 				and _member_span(m) != span
 			]
+			if len(candidates) > 1:
+				candidates = _without_overload_stubs(candidates, [workspace_symbol_position(m)[:2] for m in candidates])
 			if len(candidates) > 1:
 				raise await _ambiguous(client, query, candidates, workspace_root)
 			if not candidates:
@@ -295,6 +440,32 @@ async def _resolve_dotted(
 	if inherited is None:
 		raise _not_found(query)
 	return inherited
+
+
+async def _resolve_module_path(client: LspClient, workspace_root: Path, query: str) -> ResolvedSymbol | None:
+	"""`pkg.mod.func` (or `pkg.mod.Class.method`): the longest leading part that
+	names a module file (`pkg/mod.py` or `pkg/mod/__init__.py`) wins over the
+	class-qualifier reading. `None` when no module file defines the rest."""
+	parts = query.split(".")
+	for cut in range(len(parts) - 1, 0, -1):
+		head = _nfkc(parts[cut])
+		module_path = "/".join(parts[:cut])
+		suffixes = (module_path + ".py", module_path + "/__init__.py")
+		symbols = await client.workspace_symbol(head)
+		files = [
+			rel
+			for sym in symbols
+			if _nfkc(str(sym.get("name") or "")) == head
+			for rel in [uri_to_relative((sym.get("location") or {}).get("uri", ""), workspace_root)]
+			if any(rel == suffix or rel.endswith("/" + suffix) for suffix in suffixes)
+		]
+		if not files:
+			continue
+		try:
+			return await resolve_symbol(client, workspace_root, ".".join(parts[cut:]), file_path=files[0])
+		except SymbolNotFoundError:
+			continue
+	return None
 
 
 # Guards against pathological (or cyclic, if a server reports one) hierarchies;
@@ -346,13 +517,30 @@ async def _resolve_inherited(
 async def resolve_symbol(
 	client: LspClient, workspace_root: Path, query: str, *, file_path: str | None = None
 ) -> ResolvedSymbol:
-	"""Resolve a name (or dotted `Class.method`) to a single symbol position.
+	"""Resolve a name (or dotted `Class.method`, or `pkg.mod.name`) to a single symbol position.
 
 	Raises `SymbolResolutionError` (a `ToolInputError`, so tools' existing
 	`except TOOL_ERRORS` handles it) when nothing matches or several symbols
 	tie on an exact name — callers should pass `file_path` to disambiguate
-	rather than guess.
+	rather than guess. `SymbolNotFoundError` is the no-match subclass.
 	"""
+	problem = symbol_name_problem(query)
+	if problem is not None:
+		raise ToolInputError(problem)
 	if "." in query:
+		if file_path is None:
+			module_first = await _resolve_module_path(client, workspace_root, query)
+			if module_first is not None:
+				return module_first
 		return await _resolve_dotted(client, workspace_root, query, file_path=file_path)
-	return await _resolve_simple(client, workspace_root, query, file_path=file_path)
+	try:
+		return await _resolve_simple(client, workspace_root, query, file_path=file_path)
+	except SymbolResolutionError:
+		if file_path is not None:
+			candidate = (workspace_root / file_path).resolve()
+			if candidate.is_relative_to(workspace_root.resolve()) and declares_type_parameter(candidate, query):
+				raise ToolInputError(
+					f"{query} is a type parameter (PEP 695) in {file_path}, not a navigable symbol; "
+					"edit its declaration and uses by hand."
+				) from None
+		raise

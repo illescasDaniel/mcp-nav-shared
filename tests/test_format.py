@@ -360,8 +360,9 @@ def test_given_only_fuzzy_hits_when_format_workspace_symbols_then_fuzzy_hits_kep
 	# when
 	text = format_workspace_symbols(symbols, tmp_path, query="LspCfL")
 	# then
-	assert [line.split()[0] for line in text.splitlines()] == ["LspClient", "LspConfigLoader"]
-	assert "fuzzy" not in text
+	assert "2 looser fuzzy matches" in text
+	assert "fuzzy=true" in text
+	assert "LspClient" not in text
 
 
 def test_given_cap_and_hidden_fuzzy_when_format_workspace_symbols_then_counts_exclude_fuzzy(tmp_path):
@@ -586,7 +587,7 @@ def test_given_incoming_calls_when_format_callers_then_lists_call_sites(tmp_path
 	# when
 	text = format_callers([call], tmp_path)
 	# then
-	assert text == "caller_fn  [Function]  (a.py:5) calls at L10, L13"
+	assert text == "1 caller(s) in 1 file(s):\ncaller_fn  [Function]  (a.py:5) calls at L10, L13"
 
 
 def test_given_no_locations_when_format_references_grouped_then_message(tmp_path):
@@ -632,7 +633,7 @@ def test_given_locations_at_or_under_limit_when_format_references_then_full_snip
 	# when
 	text = format_references(locs, tmp_path, snippet_limit=2)
 	# then
-	assert text == "\n\n".join(format_location(loc, tmp_path) for loc in locs)
+	assert text == "2 reference(s) in 2 file(s):\n" + "\n\n".join(format_location(loc, tmp_path) for loc in locs)
 
 
 def test_given_locations_over_limit_when_format_references_then_compact_grouped_with_columns(tmp_path):
@@ -646,7 +647,6 @@ def test_given_locations_over_limit_when_format_references_then_compact_grouped_
 	text = format_references(locs, tmp_path, snippet_limit=2)
 	# then
 	assert text.splitlines() == [
-		"(compact list: 3 > 2 hits)",
 		"3 reference(s) in 2 file(s):",
 		"a.py: L1:5, L6:1",
 		"b.py: L3:1",

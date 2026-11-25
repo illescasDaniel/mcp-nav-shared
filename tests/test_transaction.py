@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 
 import pytest
@@ -75,10 +76,10 @@ def test_given_write_failure_midway_when_apply_then_earlier_files_restored(tmp_p
 	plan = _plan(tmp_path, {"a.py": ("a = 1\n", "a = 2\n"), "b.py": ("b = 1\n", "b = 2\n")})
 	real = transaction._write_atomic
 
-	def flaky(path, data):
+	def flaky(path, data, mode=None):
 		if path.name == "b.py" and data == b"b = 2\n":
-			raise OSError("disk full")
-		real(path, data)
+			raise OSError(errno.ENOSPC, "disk full")
+		real(path, data, mode)
 
 	monkeypatch.setattr(transaction, "_write_atomic", flaky)
 	# when
@@ -134,7 +135,7 @@ def test_given_nothing_applied_when_undo_then_input_error(tmp_path):
 def test_given_unknown_id_when_undo_then_input_error(tmp_path):
 	journal = EditJournal(_guard(tmp_path))
 	journal.apply(_plan(tmp_path, {"a.py": ("x\n", "y\n")}))
-	with pytest.raises(ToolInputError, match="unknown edit id"):
+	with pytest.raises(ToolInputError, match="is not in the undo history"):
 		journal.undo("nope")
 
 

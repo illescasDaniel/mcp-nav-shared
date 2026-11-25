@@ -176,7 +176,9 @@ def test_given_ambiguous_methods_when_resolve_symbol_then_qualifies_with_class_n
 	assert "Alpha.run" in text
 	assert "Beta.run" in text
 	assert "same file" in text
-	assert "search_symbol" in text
+	# RC-102: the hint names a path the move/change_signature tools can take
+	assert "give file_path= and the qualified name (Class.member)" in text
+	assert "search_symbol" not in text
 
 
 def test_given_file_path_when_two_exact_matches_then_narrows_to_match(tmp_path):

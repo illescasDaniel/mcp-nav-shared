@@ -163,7 +163,7 @@ def test_given_file_with_bom_when_changes_from_edits_then_bom_is_kept(tmp_path):
 	path = tmp_path / "a.py"
 	path.write_bytes(b"\xef\xbb\xbfx = 1\n")
 	# when
-	[change] = changes_from_edits({path: [_edit(0, 0, 0, 1, "y")]})
+	[change] = changes_from_edits({path: [_edit(0, 0, 0, 1, "y")]}, bom_in_positions=False)
 	# then
 	assert change.new_bytes() == b"\xef\xbb\xbfy = 1\n"
 

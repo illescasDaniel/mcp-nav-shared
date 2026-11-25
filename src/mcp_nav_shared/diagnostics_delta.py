@@ -8,8 +8,10 @@ problem into "one fixed, one new".
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
+
+from mcp_nav_shared.edits import split_lines
 
 
 _SEVERITY_LABELS = {1: "error", 2: "warning", 3: "info", 4: "hint"}
@@ -46,7 +48,7 @@ class DiagEntry:
 
 
 def entries_from_lsp(rel_path: str, text: str, items: list[dict[str, Any]]) -> list[DiagEntry]:
-	lines = text.splitlines()
+	lines = split_lines(text)  # line ends are \n, \r\n, \r as in Python; a form feed is an ordinary character
 	entries = []
 	for item in items:
 		start = (item.get("range") or {}).get("start") or {}
@@ -76,6 +78,8 @@ class DiagnosticsDelta:
 	files_checked: int = 0
 	# Files that could not be checked (read/LSP failure), so the comparison is partial.
 	unchecked: list[str] = field(default_factory=list)
+	# What was left out on purpose (e.g. importers in excluded directories), one message per group.
+	notes: list[str] = field(default_factory=list)
 
 	@property
 	def new_errors(self) -> list[DiagEntry]:
@@ -106,11 +110,29 @@ def _subtract(left: list[DiagEntry], right: list[DiagEntry], key: str) -> tuple[
 	return unmatched_left, unmatched_right
 
 
-def diff_diagnostics(before: list[DiagEntry], after: list[DiagEntry]) -> DiagnosticsDelta:
+def diff_diagnostics(
+	before: list[DiagEntry], after: list[DiagEntry], *, renames: dict[str, str] | None = None
+) -> DiagnosticsDelta:
 	"""Pair identical diagnostics (same message on the same source line), then pair
 	what is left by message alone (the same problem on an edited line)."""
+	if renames:
+		before = [replace(entry, path=renames.get(entry.path, entry.path)) for entry in before]
 	new, fixed = _subtract(after, before, "strict_key")
-	new, fixed = _subtract(new, fixed, "loose_key")
+	if renames:
+		# A moved file only matches on its source line; loose matching would hide a
+		# new occurrence of the same diagnostic elsewhere in the moved file.
+		targets = set(renames.values())
+		moved_new = [entry for entry in new if entry.path in targets]
+		moved_fixed = [entry for entry in fixed if entry.path in targets]
+		new, fixed = _subtract(
+			[entry for entry in new if entry.path not in targets],
+			[entry for entry in fixed if entry.path not in targets],
+			"loose_key",
+		)
+		new.extend(moved_new)
+		fixed.extend(moved_fixed)
+	else:
+		new, fixed = _subtract(new, fixed, "loose_key")
 	# `_subtract` returns the right-hand leftovers in dict order; keep reports stable.
 	new.sort(key=lambda entry: (entry.path, entry.line, entry.column))
 	fixed.sort(key=lambda entry: (entry.path, entry.line, entry.column))
@@ -129,6 +151,7 @@ def format_delta(delta: DiagnosticsDelta, *, limit: int = 15) -> str:
 	lines = [headline]
 	if delta.unchecked:
 		lines.append(f"  not checked: {', '.join(delta.unchecked[:5])}")
+	lines.extend(f"  {note}" for note in delta.notes)
 	shown = delta.new[:limit]
 	if shown:
 		lines.append("New:")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ class UnsupportedEditError(ToolInputError):
 _LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
 _TRAILING_BREAK_RE = re.compile(r"(?:\r\n|\r|\n)$")
 _BOM = "\ufeff"
+_BOM_BYTES = _BOM.encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -63,7 +65,8 @@ def decode_source(raw: bytes) -> tuple[str, bool]:
 
 
 def encode_source(text: str, bom: bool = False) -> bytes:
-	return ((_BOM if bom else "") + text).encode("utf-8")
+	"""UTF-8 bytes of `text`, with a byte-order mark first when `bom` (never two of them)."""
+	return ((_BOM if bom and not text.startswith(_BOM) else "") + text).encode("utf-8")
 
 
 def read_source(path: Path) -> tuple[str, bool]:
@@ -79,6 +82,32 @@ def detect_eol(text: str) -> str:
 	crlf = text.count("\r\n")
 	lf = text.count("\n") - crlf
 	return "\r\n" if crlf > lf else "\n"
+
+
+def split_lines(text: str, keepends: bool = False) -> list[str]:
+	"""Lines of `text`, split ONLY on `\\r\\n`, `\\r` and `\\n`.
+
+	Unlike `str.splitlines` this does not split on form feed, `\\x1c`-`\\x1e`, NEL (U+0085) or
+	U+2028/U+2029, which Python source (and the language server) treat as ordinary characters.
+	"""
+	if keepends:
+		pieces: list[str] = []
+		cursor = 0
+		for match in _LINE_BREAK_RE.finditer(text):
+			pieces.append(text[cursor : match.end()])
+			cursor = match.end()
+		if cursor < len(text):
+			pieces.append(text[cursor:])
+		return pieces
+	lines = _LINE_BREAK_RE.split(text)
+	if lines and lines[-1] == "":
+		lines.pop()
+	return lines
+
+
+def convert_eol(text: str, eol: str) -> str:
+	"""`text` with every line ending (`\\r\\n`, `\\r`, `\\n`) replaced by `eol`."""
+	return _LINE_BREAK_RE.sub(eol, text)
 
 
 def _line_starts(text: str) -> list[int]:
@@ -115,11 +144,28 @@ def position_to_offset(text: str, line: int, character: int, starts: list[int] |
 	return line_start + _column_to_index(content, character)
 
 
-def apply_text_edits(text: str, edits: list[TextEdit]) -> str:
+def _bom_adjusted(edit: TextEdit) -> TextEdit:
+	"""Translate positions measured in a document that includes a leading BOM."""
+	if (edit.start_line == 0 and edit.start_character < 1) or (edit.end_line == 0 and edit.end_character < 1):
+		raise EditConflictError("edit targets the byte-order mark; cannot safely apply it")
+	return TextEdit(
+		start_line=edit.start_line,
+		start_character=edit.start_character - (edit.start_line == 0),
+		end_line=edit.end_line,
+		end_character=edit.end_character - (edit.end_line == 0),
+		new_text=edit.new_text,
+	)
+
+
+def apply_text_edits(
+	text: str, edits: list[TextEdit], *, bom: bool = False, bom_in_positions: bool | None = None
+) -> str:
 	"""Apply LSP edits against the original `text` (positions all refer to it).
 
 	Overlapping edits raise `EditConflictError`; several insertions at one point
 	keep their given order. Inserted text uses the file's own line endings.
+	`text` has no byte-order mark; `bom=True` says the file it came from had one, so first-line
+	first-line positions require an explicit `bom_in_positions` convention.
 	"""
 	if not edits:
 		return text
@@ -127,11 +173,16 @@ def apply_text_edits(text: str, edits: list[TextEdit]) -> str:
 	starts = _line_starts(text)
 	spans: list[tuple[int, int, int, str]] = []
 	for order, edit in enumerate(edits):
+		if bom and (edit.start_line == 0 or edit.end_line == 0):
+			if bom_in_positions is None:
+				raise EditConflictError("cannot safely apply a first-line edit: BOM coordinate convention is unknown")
+			if bom_in_positions:
+				edit = _bom_adjusted(edit)
 		start = position_to_offset(text, edit.start_line, edit.start_character, starts)
 		end = position_to_offset(text, edit.end_line, edit.end_character, starts)
 		if end < start:
 			raise EditConflictError(f"edit range ends before it starts (line {edit.start_line + 1})")
-		spans.append((start, end, order, _LINE_BREAK_RE.sub(eol, edit.new_text)))
+		spans.append((start, end, order, convert_eol(edit.new_text, eol)))
 	spans.sort(key=lambda span: (span[0], span[1], span[2]))
 	pieces: list[str] = []
 	cursor = 0
@@ -156,7 +207,7 @@ def replace_lines(text: str, first_line: int, last_line: int, replacement: str) 
 	begin = starts[first_line - 1]
 	end = starts[last_line] if last_line < len(starts) else len(text)
 	eol = detect_eol(text)
-	return text[:begin] + _LINE_BREAK_RE.sub(eol, replacement) + text[end:]
+	return text[:begin] + convert_eol(replacement, eol) + text[end:]
 
 
 def uri_to_file_path(uri: str) -> Path:
@@ -190,15 +241,53 @@ def parse_workspace_edit(edit: dict[str, Any] | None) -> dict[Path, list[TextEdi
 	return by_path
 
 
+def _file_has_bom(path: Path) -> bool:
+	try:
+		with path.open("rb") as handle:
+			return handle.read(len(_BOM_BYTES)) == _BOM_BYTES
+	except OSError:
+		return False
+
+
 @dataclass(frozen=True)
 class FileChange:
-	"""The whole-file effect of an edit: `old_text` None creates the file, `new_text` None deletes it."""
+	"""The whole-file effect of an edit: `old_text` None creates the file, `new_text` None deletes it.
+
+	Texts never carry a byte-order mark: it is the flags' job. Left at `None`, `old_bom` is read from
+	the file as it is on disk (so every write site keeps a file's BOM) and `new_bom` follows `old_bom`.
+	A leading U+FEFF on `new_text` is dropped.
+	"""
 
 	path: Path
 	old_text: str | None
 	new_text: str | None
-	old_bom: bool = False
-	new_bom: bool = False
+	old_bom: bool | None = None
+	new_bom: bool | None = None
+	# Permission bits (`st_mode`). Left at `None`, `old_mode` is read from the file as it is on disk, and a
+	# written file keeps the mode of the file it replaces; `new_mode` is for a file this change creates
+	# (e.g. the destination of a move takes its source's mode, so +x scripts stay executable).
+	old_mode: int | None = field(default=None, kw_only=True)
+	new_mode: int | None = field(default=None, kw_only=True)
+
+	def __post_init__(self) -> None:
+		old_bom = self.old_bom
+		if self.old_text is not None and self.old_text.startswith(_BOM):
+			object.__setattr__(self, "old_text", self.old_text[1:])
+			old_bom = True
+		elif old_bom is None:
+			old_bom = self.old_text is not None and _file_has_bom(self.path)
+		object.__setattr__(self, "old_bom", old_bom)
+		if self.new_bom is None:
+			object.__setattr__(self, "new_bom", old_bom)
+		if self.new_text is not None and self.new_text.startswith(_BOM):
+			object.__setattr__(self, "new_text", self.new_text[1:])
+		if self.old_mode is None and self.old_text is not None and self.path.exists():
+			object.__setattr__(self, "old_mode", stat.S_IMODE(self.path.stat().st_mode))
+
+	@property
+	def bom(self) -> bool:
+		"""Whether the file had a byte-order mark as read."""
+		return bool(self.old_bom)
 
 	@property
 	def kind(self) -> str:
@@ -213,21 +302,32 @@ class FileChange:
 		return self.old_text == self.new_text and self.old_bom == self.new_bom
 
 	def old_bytes(self) -> bytes | None:
-		return None if self.old_text is None else encode_source(self.old_text, self.old_bom)
+		return None if self.old_text is None else encode_source(self.old_text, bool(self.old_bom))
 
 	def new_bytes(self) -> bytes | None:
-		return None if self.new_text is None else encode_source(self.new_text, self.new_bom)
+		return None if self.new_text is None else encode_source(self.new_text, bool(self.new_bom))
 
 	def inverse(self) -> FileChange:
-		return FileChange(self.path, self.new_text, self.old_text, self.new_bom, self.old_bom)
+		return FileChange(
+			self.path,
+			self.new_text,
+			self.old_text,
+			self.new_bom,
+			self.old_bom,
+			old_mode=self.new_mode,
+			new_mode=self.old_mode,
+		)
 
 
-def changes_from_edits(edits_by_path: dict[Path, list[TextEdit]]) -> list[FileChange]:
+def changes_from_edits(
+	edits_by_path: dict[Path, list[TextEdit]], *, bom_in_positions: bool | dict[Path, bool | None] | None = None
+) -> list[FileChange]:
 	"""Apply per-file edits to what is on disk now. No-op results are dropped."""
 	changes: list[FileChange] = []
 	for path in sorted(edits_by_path):
 		old_text, bom = read_source(path)
-		new_text = apply_text_edits(old_text, edits_by_path[path])
+		convention = bom_in_positions.get(path.resolve()) if isinstance(bom_in_positions, dict) else bom_in_positions
+		new_text = apply_text_edits(old_text, edits_by_path[path], bom=bom, bom_in_positions=convention)
 		change = FileChange(path, old_text, new_text, bom, bom)
 		if not change.is_noop:
 			changes.append(change)
@@ -246,8 +346,8 @@ def relative_name(path: Path, root: Path) -> str:
 
 def unified_diff(change: FileChange, root: Path, *, context: int = 2) -> str:
 	name = relative_name(change.path, root)
-	old = (change.old_text or "").splitlines(keepends=True)
-	new = (change.new_text or "").splitlines(keepends=True)
+	old = split_lines(change.old_text or "", keepends=True)
+	new = split_lines(change.new_text or "", keepends=True)
 	label_old = "/dev/null" if change.old_text is None else f"a/{name}"
 	label_new = "/dev/null" if change.new_text is None else f"b/{name}"
 	lines = list(difflib.unified_diff(old, new, label_old, label_new, n=context))
@@ -256,8 +356,8 @@ def unified_diff(change: FileChange, root: Path, *, context: int = 2) -> str:
 
 def count_changed_lines(change: FileChange) -> tuple[int, int]:
 	"""(added, removed) line counts."""
-	old = (change.old_text or "").splitlines()
-	new = (change.new_text or "").splitlines()
+	old = split_lines(change.old_text or "")
+	new = split_lines(change.new_text or "")
 	added = removed = 0
 	for opcode, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
 		if opcode in ("replace", "delete"):
@@ -297,18 +397,21 @@ class EditPlan:
 	def inverse(self) -> EditPlan:
 		return EditPlan(f"undo: {self.description}", [change.inverse() for change in reversed(self.changes)])
 
-	def summary(self, root: Path) -> str:
+	def summary(self, root: Path, *, limit: int = 60) -> str:
+		"""One line per touched file; past `limit` files the rest is only counted."""
 		lines = []
-		for change in self.changes:
+		for change in self.changes[:limit]:
 			added, removed = count_changed_lines(change)
 			name = relative_name(change.path, root)
 			tag = {"create": " (new file)", "delete": " (deleted)"}.get(change.kind, "")
 			lines.append(f"  {name}{tag}: +{added} -{removed}")
+		if len(self.changes) > limit:
+			lines.append(f"  ... and {len(self.changes) - limit} more files")
 		return "\n".join(lines)
 
 	def diff(self, root: Path, *, context: int = 2, max_lines: int = 300) -> str:
 		text = "".join(unified_diff(change, root, context=context) for change in self.changes)
-		lines = text.splitlines()
+		lines = split_lines(text)
 		if len(lines) <= max_lines:
 			return text
 		return "\n".join(lines[:max_lines]) + f"\n... diff truncated ({len(lines) - max_lines} more lines)\n"

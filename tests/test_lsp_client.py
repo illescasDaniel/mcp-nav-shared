@@ -177,9 +177,10 @@ def test_given_server_dies_at_startup_when_start_then_error_quotes_its_stderr(tm
 	# when
 	with pytest.raises(LanguageServerExitedError) as caught:
 		asyncio.run(client.start())
-	# then — the agent sees the cause, not just "exited"
+	# then — the agent sees a short message; the cause (stderr) is kept in `.detail` and the log
 	assert "language server exited" in str(caught.value)
-	assert "Failed to spawn: ty" in str(caught.value)
+	assert "Failed to spawn: ty" not in str(caught.value)
+	assert "Failed to spawn: ty" in caught.value.detail
 
 
 def test_given_never_started_when_is_alive_then_false(tmp_path):
@@ -861,10 +862,21 @@ def test_given_active_overlay_when_refresh_then_it_waits_until_overlay_ends(tmp_
 			await client.refresh()
 			order.append("refreshed")
 
-		async with client.overlay({src: "x = 2\n"}):
-			task = asyncio.create_task(_refresher())
-			await asyncio.sleep(0.05)
-			order.append("overlay still active")
+		inside, release = asyncio.Event(), asyncio.Event()
+
+		async def _preview() -> None:
+			async with client.overlay({src: "x = 2\n"}):
+				inside.set()
+				await release.wait()
+
+		# the preview is its own task: a task spawned INSIDE the overlay belongs to it and doesn't wait
+		preview = asyncio.create_task(_preview())
+		await inside.wait()
+		task = asyncio.create_task(_refresher())
+		await asyncio.sleep(0.05)
+		order.append("overlay still active")
+		release.set()
+		await preview
 		await task
 
 	# when

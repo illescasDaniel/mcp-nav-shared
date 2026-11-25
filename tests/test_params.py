@@ -20,9 +20,15 @@ def test_given_only_name_when_preferred_query_then_returns_name_as_alias():
 	assert resolve_name_query(preferred="query", example="Foo", query=None, name="Foo") == "Foo"
 
 
-def test_given_both_when_resolve_then_prefers_preferred_param():
-	assert resolve_name_query(preferred="name", example="A", name="from-name", query="from-query") == "from-name"
-	assert resolve_name_query(preferred="query", example="A", name="from-name", query="from-query") == "from-query"
+def test_given_both_with_different_values_when_resolve_then_refuses_conflict():
+	with pytest.raises(ToolInputError, match="give either name or query, not both"):
+		resolve_name_query(preferred="name", example="A", name="from-name", query="from-query")
+	with pytest.raises(ToolInputError, match="give either name or query, not both"):
+		resolve_name_query(preferred="query", example="A", name="from-name", query="from-query")
+
+
+def test_given_both_with_same_value_when_resolve_then_returns_it():
+	assert resolve_name_query(preferred="name", example="A", name="Cart", query="Cart") == "Cart"
 
 
 def test_given_neither_when_resolve_then_tool_input_error_mentions_alias():
