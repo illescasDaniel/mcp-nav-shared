@@ -23,7 +23,7 @@ import stat as stat_module
 import tempfile
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Concatenate, ParamSpec, TypeVar
@@ -120,6 +120,15 @@ _OVERLAY_MTIME = -2
 
 # LSP `FileChangeType`.
 _FILE_CREATED, _FILE_CHANGED, _FILE_DELETED = 1, 2, 3
+
+
+def _directory_events(directories: Iterable[Path], kind: int) -> list[dict[str, Any]]:
+	"""`didChangeWatchedFiles` entries for directories: outermost first when created, innermost first when deleted.
+
+	A file created in a directory the server has never seen is not enough for it: ty keeps resolving a new
+	namespace package (a directory with no `__init__.py`) as missing until the directory itself is reported."""
+	ordered = sorted(set(directories), key=lambda d: len(d.parts), reverse=kind == _FILE_DELETED)
+	return [{"uri": directory.as_uri(), "type": kind} for directory in ordered]
 
 
 _P = ParamSpec("_P")
@@ -718,19 +727,36 @@ class LspClient:
 			elif previous_configs is None:
 				await asyncio.to_thread(self._changed_configs, configs, None)
 			changes: list[dict[str, Any]] = []
+			created_directories: list[dict[str, Any]] = []
+			deleted_directories: list[dict[str, Any]] = []
 			previous = self._watch_snapshot
 			if previous is not None:
+				created_files = [path for path in current if path not in previous]
+				deleted_files = [path for path in previous if path not in current]
+				root = self.workspace_root.resolve()
+				if created_files:
+					known = {parent for path in previous for parent in path.parents}
+					created_directories = _directory_events(
+						{p for path in created_files for p in path.parents if p not in known and root in p.parents},
+						_FILE_CREATED,
+					)
 				for path, stamp in current.items():
 					if path not in previous:
 						changes.append({"uri": path.as_uri(), "type": _FILE_CREATED})
 					elif previous[path] != stamp:
 						changes.append({"uri": path.as_uri(), "type": _FILE_CHANGED})
-				changes.extend(
-					{"uri": path.as_uri(), "type": _FILE_DELETED} for path in previous if path not in current
-				)
+				changes.extend({"uri": path.as_uri(), "type": _FILE_DELETED} for path in deleted_files)
+				if deleted_files:
+					gone = {p for path in deleted_files for p in path.parents if root in p.parents and not p.exists()}
+					deleted_directories = _directory_events(gone, _FILE_DELETED)
 			self._watch_snapshot = current
 			if changes:
-				self._notify("workspace/didChangeWatchedFiles", {"changes": changes})
+				# Directories go with their files (a new one before them, a removed one after them), but only the
+				# files are opened below.
+				self._notify(
+					"workspace/didChangeWatchedFiles",
+					{"changes": [*created_directories, *changes, *deleted_directories]},
+				)
 			if self.open_watched_changes:
 				for change in changes:
 					if change["type"] != _FILE_DELETED:
@@ -1220,7 +1246,12 @@ class LspClient:
 				if transient:
 					self._notify(
 						"workspace/didChangeWatchedFiles",
-						{"changes": [{"uri": p.as_uri(), "type": _FILE_CREATED} for p in transient]},
+						{
+							"changes": [
+								*_directory_events(created_dirs, _FILE_CREATED),
+								*({"uri": p.as_uri(), "type": _FILE_CREATED} for p in transient),
+							]
+						},
 					)
 				yield
 			finally:
@@ -1239,7 +1270,12 @@ class LspClient:
 					if transient and self._proc is not None:
 						self._notify(
 							"workspace/didChangeWatchedFiles",
-							{"changes": [{"uri": p.as_uri(), "type": _FILE_DELETED} for p in transient]},
+							{
+								"changes": [
+									*({"uri": p.as_uri(), "type": _FILE_DELETED} for p in transient),
+									*_directory_events([d for d in created_dirs if not d.exists()], _FILE_DELETED),
+								]
+							},
 						)
 					for uri in uris if self._proc is not None else []:
 						path = Path(_uri_to_path(uri))
