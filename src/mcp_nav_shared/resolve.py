@@ -311,6 +311,28 @@ def _near_names(query: str, symbols: list[dict[str, Any]]) -> list[str]:
 	return difflib.get_close_matches(_nfkc(query), names, n=_NEAR_NAME_COUNT)
 
 
+async def _same_file_hint(client: LspClient, candidates: list[dict[str, Any]], workspace_root: Path) -> str:
+	"""Name the first two same-file candidates by qualified name and file:line, so the agent can pick one."""
+	qualified = await _qualify_candidates(client, workspace_root, candidates)
+	names: list[str] = []
+	options: list[str] = []
+	for i, sym in enumerate(candidates):
+		qualifier = qualified.get(i)
+		uri, line, _ = workspace_symbol_position(sym)
+		rel = uri_to_relative(uri, workspace_root) if uri else "?"
+		name = f"{qualifier + '.' if qualifier else ''}{sym.get('name') or '?'}"
+		names.append(name)
+		options.append(f"{name} ({rel}:{line + 1})")
+	if len(set(names)) < len(names):
+		return (
+			f"they all live in one file and share a name ({options[0]}); "
+			"rename one of them first so each has its own name"
+		)
+	return (
+		f"they all live in one file; pass file_path and the qualified name of the one you mean: {' or '.join(options)}"
+	)
+
+
 async def _ambiguous(
 	client: LspClient,
 	query: str,
@@ -323,8 +345,8 @@ async def _ambiguous(
 		# file already) still leaves several same-named symbols there — e.g.
 		# a module-level function and a same-named class method — so
 		# file_path alone can't disambiguate further. Position tools take no
-		# line/column in move/change_signature, so point at the qualified name.
-		hint = "these all live in the same file; give file_path= and the qualified name (Class.member) instead"
+		# line/column in move/change_signature, so name the qualified candidates.
+		hint = await _same_file_hint(client, candidates[:2], workspace_root)
 	else:
 		hint = "pass file_path to disambiguate"
 	return SymbolResolutionError(

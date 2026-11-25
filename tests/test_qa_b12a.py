@@ -140,7 +140,8 @@ def test_rc_102_same_file_ambiguity_points_to_file_path_and_qualified_name(tmp_p
 	with pytest.raises(SymbolResolutionError) as caught:
 		asyncio.run(resolve_symbol(client, tmp_path, "run"))
 	text = str(caught.value)
-	assert "these all live in the same file; give file_path= and the qualified name (Class.member) instead" in text
+	assert "they all live in one file and share a name" in text  # two module-level `run`s: same qualified name
+	assert "rename one of them first" in text
 	assert "search_symbol" not in text
 
 

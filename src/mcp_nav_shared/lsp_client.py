@@ -395,7 +395,8 @@ class LspClient:
 		if not pending:
 			return
 		message, detail = self._exit_message()
-		logger.warning("%s\n%s", message, detail)
+		# Short line only: the stderr tail and the command line (venv paths) stay out of the server's own log.
+		logger.warning("%s", message)
 		for fut in pending.values():
 			if not fut.done():
 				fut.set_exception(LanguageServerExitedError(message, detail))

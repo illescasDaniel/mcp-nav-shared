@@ -135,7 +135,7 @@ def test_rc_050_evicted_preview_says_why(tmp_path):
 		store.get(ids[0])
 	assert str(raised.value) == (
 		f"unknown or expired preview id '{ids[0]}' (pending: {ids[1]}, {ids[2]}); "
-		"only the last 2 previews are kept, so re-run the edit if this one was evicted"
+		"previews live in memory (the last 2 are kept) and are lost when the server restarts; re-run the edit with apply=false if this one was evicted"
 	)
 
 

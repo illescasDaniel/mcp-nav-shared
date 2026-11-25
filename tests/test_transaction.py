@@ -128,7 +128,7 @@ def test_given_deleted_file_when_undo_then_recreated(tmp_path):
 
 
 def test_given_nothing_applied_when_undo_then_input_error(tmp_path):
-	with pytest.raises(ToolInputError, match="nothing to undo"):
+	with pytest.raises(ToolInputError, match="no recent edits to revert"):
 		EditJournal(_guard(tmp_path)).undo()
 
 

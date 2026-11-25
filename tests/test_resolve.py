@@ -175,9 +175,10 @@ def test_given_ambiguous_methods_when_resolve_symbol_then_qualifies_with_class_n
 	text = str(caught.value)
 	assert "Alpha.run" in text
 	assert "Beta.run" in text
-	assert "same file" in text
+	assert "they all live in one file" in text
+	assert "Alpha.run (svc.py:2) or Beta.run (svc.py:12)" in text
 	# RC-102: the hint names a path the move/change_signature tools can take
-	assert "give file_path= and the qualified name (Class.member)" in text
+	assert "pass file_path and the qualified name of the one you mean:" in text
 	assert "search_symbol" not in text
 
 

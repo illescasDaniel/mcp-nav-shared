@@ -452,7 +452,11 @@ class EditJournal:
 		files was changed after it, so later work is never overwritten."""
 		if edit_id is None:
 			if not self._entries:
-				raise ToolInputError("nothing to undo: no edits were applied by this server")
+				raise ToolInputError(
+					"no recent edits to revert: the journal keeps the last "
+					f"{self._max_entries} edits (older edits were evicted); pass the edit id from the original reply "
+					"to revert a specific edit"
+				)
 			edit_id = next(reversed(self._entries))
 		entry = self._entries.get(edit_id)
 		if entry is None:
@@ -548,7 +552,7 @@ class PlanStore:
 				)
 			known = ", ".join(self._plans) or "none"
 			raise ToolInputError(
-				f"unknown or expired preview id {shown!r} (pending: {known}); only the last {self._max_entries} previews are kept, so re-run the edit if this one was evicted"
+				f"unknown or expired preview id {shown!r} (pending: {known}); previews live in memory (the last {self._max_entries} are kept) and are lost when the server restarts; re-run the edit with apply=false if this one was evicted"
 			)
 		return plan
 
